@@ -344,6 +344,113 @@ struct choc::ui::WebView::Pimpl
             navigate ({});
         }
 
+        // Inject the JS helper that lets page code arm a native file drag-out.
+        addInitScript ("window.chocStartFileDrag = function (paths) {"
+                       " try { window.webkit.messageHandlers.external.postMessage ('CHOC_DRAG:' + JSON.stringify (paths)); }"
+                       " catch (e) {} };");
+
+        // Inbound: accept OS file drops onto the webview and forward paths to JS.
+        installDropTarget();
+
+        g_signal_connect (webview, "drag-data-received",
+                          G_CALLBACK (+[] (GtkWidget*, GdkDragContext* ctx, gint, gint,
+                                           GtkSelectionData* data, guint, guint time, gpointer arg)
+                          {
+                              auto* self = static_cast<Pimpl*> (arg);
+                              std::vector<std::string> paths;
+
+                              if (gchar** uris = gtk_selection_data_get_uris (data))
+                              {
+                                  for (gchar** u = uris; *u != nullptr; ++u)
+                                      if (gchar* fn = g_filename_from_uri (*u, nullptr, nullptr))
+                                      {
+                                          paths.push_back (fn);
+                                          g_free (fn);
+                                      }
+
+                                  g_strfreev (uris);
+                              }
+
+                              gtk_drag_finish (ctx, ! paths.empty(), FALSE, time);
+                              self->forwardDroppedFilesToJS (paths);
+                          }),
+                          this);
+
+        // Outbound: when JS has armed a drag and the user drags with button 1
+        // held, begin a native file drag from the LIVE motion event. GTK needs a
+        // live event to establish the drag grab that tracks the pointer — this is
+        // the GTK analogue of the macOS mouseDragged: seam (starting the drag from
+        // the async JS-arm callback fails: no grab, so it self-drops immediately).
+        gtk_widget_add_events (webview, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK
+                                        | GDK_POINTER_MOTION_MASK | GDK_BUTTON1_MOTION_MASK);
+
+        g_signal_connect (webview, "button-press-event",
+                          G_CALLBACK (+[] (GtkWidget*, GdkEvent*, gpointer arg) -> gboolean
+                          {
+                              static_cast<Pimpl*> (arg)->dragActive = false;
+                              return FALSE;
+                          }), this);
+
+        // While our own drag-out is in flight, stop being our own drop target so
+        // the drag can't immediately self-drop onto the source webview.
+        g_signal_connect (webview, "drag-begin",
+                          G_CALLBACK (+[] (GtkWidget* w, GdkDragContext*, gpointer)
+                          {
+                              gtk_drag_dest_unset (w);
+                          }), nullptr);
+
+        g_signal_connect (webview, "motion-notify-event",
+                          G_CALLBACK (+[] (GtkWidget* w, GdkEvent* event, gpointer arg) -> gboolean
+                          {
+                              auto* self = static_cast<Pimpl*> (arg);
+
+                              if (! self->dragActive
+                                   && ! self->pendingDragFilePaths.empty()
+                                   && (event->motion.state & GDK_BUTTON1_MASK) != 0)
+                              {
+                                  self->dragActive = true;
+
+                                  GtkTargetList* targets = gtk_target_list_new (nullptr, 0);
+                                  gtk_target_list_add_uri_targets (targets, 0);
+                                  gtk_drag_begin_with_coordinates (w, targets, GDK_ACTION_COPY, 1, event, -1, -1);
+                                  gtk_target_list_unref (targets);
+                              }
+
+                              return FALSE;
+                          }), this);
+
+        // Outbound: supply the armed file URIs when GTK asks for the drag payload.
+        g_signal_connect (webview, "drag-data-get",
+                          G_CALLBACK (+[] (GtkWidget*, GdkDragContext*, GtkSelectionData* data,
+                                           guint, guint, gpointer arg)
+                          {
+                              auto* self = static_cast<Pimpl*> (arg);
+                              std::vector<std::string> uriStrings;
+
+                              for (auto& p : self->pendingDragFilePaths)
+                                  if (gchar* uri = g_filename_to_uri (p.c_str(), nullptr, nullptr))
+                                  {
+                                      uriStrings.push_back (uri);
+                                      g_free (uri);
+                                  }
+
+                              std::vector<gchar*> uris;
+                              for (auto& u : uriStrings)
+                                  uris.push_back (const_cast<gchar*> (u.c_str()));
+                              uris.push_back (nullptr);
+
+                              gtk_selection_data_set_uris (data, uris.data());
+                          }), this);
+
+        g_signal_connect (webview, "drag-end",
+                          G_CALLBACK (+[] (GtkWidget*, GdkDragContext*, gpointer arg)
+                          {
+                              auto* self = static_cast<Pimpl*> (arg);
+                              self->pendingDragFilePaths.clear();
+                              self->dragActive = false;
+                              self->installDropTarget(); // re-enable inbound drops
+                          }), this);
+
         gtk_widget_show_all (webview);
 
         if (options.webviewIsReady)
@@ -487,8 +594,59 @@ struct choc::ui::WebView::Pimpl
     void invokeCallback (WebKitJavascriptResult* r)
     {
         auto s = jsc_value_to_string (webkit_javascript_result_get_js_value (r));
-        owner.invokeBinding (s);
+
+        if (! handleInternalMessage (s))
+            owner.invokeBinding (s);
+
         g_free (s);
+    }
+
+    // Intercepts internal bridge messages (drag arming) before the normal
+    // binding dispatcher. Returns true if the message was consumed here.
+    bool handleInternalMessage (const std::string& body)
+    {
+        if (body.rfind ("CHOC_DRAG:", 0) != 0)
+            return false;
+
+        pendingDragFilePaths.clear();
+
+        try
+        {
+            auto list = choc::json::parseValue (body.substr (10));
+
+            if (list.isArray())
+                for (uint32_t i = 0; i < list.size(); ++i)
+                    if (list[i].isString())
+                        pendingDragFilePaths.push_back (std::string (list[i].getString()));
+        }
+        catch (...) {}
+
+        return true;
+    }
+
+    // Registers the webview as an OS file-drop destination (inbound DnD).
+    void installDropTarget()
+    {
+        gtk_drag_dest_set (webview, GTK_DEST_DEFAULT_ALL, nullptr, 0, GDK_ACTION_COPY);
+        GtkTargetList* destTargets = gtk_target_list_new (nullptr, 0);
+        gtk_target_list_add_uri_targets (destTargets, 0);
+        gtk_drag_dest_set_target_list (webview, destTargets);
+        gtk_target_list_unref (destTargets);
+    }
+
+    // Forwards inbound dropped file paths to JS as a `chocfilesdropped` event.
+    void forwardDroppedFilesToJS (const std::vector<std::string>& paths)
+    {
+        if (paths.empty())
+            return;
+
+        auto arr = choc::value::createEmptyArray();
+
+        for (auto& p : paths)
+            arr.addArrayElement (p);
+
+        evaluateJavascript ("window.dispatchEvent (new CustomEvent ('chocfilesdropped', { detail: { paths: "
+                            + choc::json::toString (arr) + " } }));", {});
     }
 
     WebView& owner;
@@ -499,6 +657,11 @@ struct choc::ui::WebView::Pimpl
     WebKitUserContentManager* manager = {};
     std::string defaultURI;
     unsigned long signalHandlerID = 0;
+
+    // Files JS has armed for a native drag-out (see chocStartFileDrag).
+    std::vector<std::string> pendingDragFilePaths;
+    // True while a native drag-out is in flight (prevents re-triggering).
+    bool dragActive = false;
 };
 
 //==============================================================================
@@ -547,6 +710,10 @@ struct choc::ui::WebView::Pimpl
 
         objc_setAssociatedObject (webview, "choc_webview", (CHOC_OBJC_CAST_BRIDGED id) this, OBJC_ASSOCIATION_ASSIGN);
 
+        // Register the webview as a destination for inbound OS file drops.
+        call<void> (webview, "registerForDraggedTypes:",
+                    callClass<id> ("NSArray", "arrayWithObject:", getNSString ("public.file-url")));
+
         if (! options->customUserAgent.empty())
             call<void> (webview, "setValue:forKey:", getNSString (options->customUserAgent), getNSString ("customUserAgent"));
 
@@ -557,6 +724,11 @@ struct choc::ui::WebView::Pimpl
             call<void> (webview, "setValue:forKey:", getNSNumberBool (false), getNSString ("drawsBackground"));
 
         call<void> (config, "release");
+
+        // Inject the JS helper that lets page code arm a native file drag-out.
+        addInitScript ("window.chocStartFileDrag = function (paths) {"
+                       " try { window.webkit.messageHandlers.external.postMessage ('CHOC_DRAG:' + JSON.stringify (paths)); }"
+                       " catch (e) {} };");
 
         if (options->fetchResource)
             navigate ({});
@@ -814,6 +986,129 @@ private:
         return false;
     }
 
+    // Intercepts internal bridge messages (drag arming) before they reach the
+    // normal binding dispatcher. Returns true if the message was consumed here.
+    bool handleInternalMessage (const std::string& body)
+    {
+        if (body.rfind ("CHOC_DRAG:", 0) != 0)
+            return false;
+
+        pendingDragFilePaths.clear();
+
+        try
+        {
+            auto list = choc::json::parseValue (body.substr (10));
+
+            if (list.isArray())
+                for (uint32_t i = 0; i < list.size(); ++i)
+                    if (list[i].isString())
+                        pendingDragFilePaths.push_back (std::string (list[i].getString()));
+        }
+        catch (...) {}
+
+        return true;
+    }
+
+    // If JS has armed a file drag, starts a native NSDraggingSession seeded from
+    // the live mouseDragged: event. Returns true if a drag was started.
+    bool beginFileDragIfArmed (id self, id event)
+    {
+        using namespace choc::objc;
+
+        if (pendingDragFilePaths.empty())
+            return false;
+
+        CHOC_AUTORELEASE_BEGIN
+
+        id items = callClass<id> ("NSMutableArray", "array");
+
+        auto winPoint  = call<objc::CGPoint> (event, "locationInWindow");
+        auto viewPoint = call<objc::CGPoint> (self, "convertPoint:fromView:", winPoint, (id) nullptr);
+
+        id workspace = callClass<id> ("NSWorkspace", "sharedWorkspace");
+
+        const objc::CGFloat iconSize = 32;
+        objc::CGFloat offset = 0;
+
+        for (auto& path : pendingDragFilePaths)
+        {
+            id nsURL = callClass<id> ("NSURL", "fileURLWithPath:", getNSString (path));
+
+            if (! nsURL)
+                continue;
+
+            id item = call<id> (callClass<id> ("NSDraggingItem", "alloc"), "initWithPasteboardWriter:", nsURL);
+
+            if (! item)
+                continue;
+
+            objc::CGRect frame;
+            frame.origin.x = viewPoint.x - iconSize * 0.5;
+            frame.origin.y = viewPoint.y - iconSize * 0.5 - offset;
+            frame.size.width = iconSize;
+            frame.size.height = iconSize;
+
+            id icon = call<id> (workspace, "iconForFile:", getNSString (path));
+            call<void> (item, "setDraggingFrame:contents:", frame, icon);
+
+            call<void> (items, "addObject:", item);
+            call<void> (item, "release");
+            offset += 6;
+        }
+
+        pendingDragFilePaths.clear();
+
+        if (call<unsigned long> (items, "count") != 0)
+        {
+            call<id> (self, "beginDraggingSessionWithItems:event:source:", items, event, self);
+            return true;
+        }
+
+        CHOC_AUTORELEASE_END
+
+        return false;
+    }
+
+    // Handles an inbound OS file drop onto the webview; forwards the dropped
+    // file paths to JS as a `chocfilesdropped` CustomEvent on window.
+    bool handleFileDrop (id draggingInfo)
+    {
+        using namespace choc::objc;
+
+        CHOC_AUTORELEASE_BEGIN
+
+        id pasteboard = call<id> (draggingInfo, "draggingPasteboard");
+        id classes = callClass<id> ("NSArray", "arrayWithObject:", (id) objc_getClass ("NSURL"));
+        id urls = call<id> (pasteboard, "readObjectsForClasses:options:", classes, (id) nullptr);
+
+        auto paths = choc::value::createEmptyArray();
+
+        if (urls)
+        {
+            auto count = call<unsigned long> (urls, "count");
+
+            for (unsigned long i = 0; i < count; ++i)
+            {
+                id url = call<id> (urls, "objectAtIndex:", i);
+                auto path = getString (call<id> (url, "path"));
+
+                if (! path.empty())
+                    paths.addArrayElement (path);
+            }
+        }
+
+        if (paths.size() == 0)
+            return false;
+
+        evaluateJavascript ("window.dispatchEvent (new CustomEvent ('chocfilesdropped', { detail: { paths: "
+                            + choc::json::toString (paths) + " } }));", {});
+        return true;
+
+        CHOC_AUTORELEASE_END
+
+        return false;
+    }
+
     void handleError (id error)
     {
         static constexpr int NSURLErrorCancelled = -999;
@@ -836,6 +1131,10 @@ private:
     std::unique_ptr<Options> options;
     id webview = {}, manager = {}, delegate = {};
     std::string defaultURI;
+
+    // Files that JS has armed for a native drag-out (see chocStartFileDrag).
+    // Populated by handleInternalMessage(), consumed on the next mouseDragged:.
+    std::vector<std::string> pendingDragFilePaths;
 
     struct WebviewClass
     {
@@ -862,6 +1161,50 @@ private:
                                 return choc::objc::callSuper<BOOL> (self, "performKeyEquivalent:", e);
                             }), "B@:@");
 
+            // Outbound native file drag: when JS has armed a drag, start an
+            // NSDraggingSession from the live event; otherwise behave normally.
+            class_addMethod (webviewClass, sel_registerName ("mouseDragged:"),
+                            (IMP) (+[](id self, SEL, id e) -> void
+                            {
+                                if (auto p = getPimpl (self))
+                                    if (p->beginFileDragIfArmed (self, e))
+                                        return;
+
+                                choc::objc::callSuper<void> (self, "mouseDragged:", e);
+                            }), "v@:@");
+
+            // NSDraggingSource conformance — required to be the drag source.
+            class_addMethod (webviewClass, sel_registerName ("draggingSession:sourceOperationMaskForDraggingContext:"),
+                            (IMP) (+[](id, SEL, id, long) -> unsigned long
+                            {
+                                return 1; // NSDragOperationCopy
+                            }), "Q@:@q");
+
+            // Inbound OS file drops: accept files and forward their paths to JS.
+            class_addMethod (webviewClass, sel_registerName ("draggingEntered:"),
+                            (IMP) (+[](id, SEL, id) -> unsigned long
+                            {
+                                return 1; // NSDragOperationCopy
+                            }), "Q@:@");
+
+            class_addMethod (webviewClass, sel_registerName ("draggingUpdated:"),
+                            (IMP) (+[](id, SEL, id) -> unsigned long
+                            {
+                                return 1; // NSDragOperationCopy
+                            }), "Q@:@");
+
+            class_addMethod (webviewClass, sel_registerName ("prepareForDragOperation:"),
+                            (IMP) (+[](id, SEL, id) -> BOOL { return true; }), "B@:@");
+
+            class_addMethod (webviewClass, sel_registerName ("performDragOperation:"),
+                            (IMP) (+[](id self, SEL, id sender) -> BOOL
+                            {
+                                if (auto p = getPimpl (self))
+                                    return p->handleFileDrop (sender);
+
+                                return false;
+                            }), "B@:@");
+
             objc_registerClassPair (webviewClass);
         }
 
@@ -885,7 +1228,12 @@ private:
                              (IMP) (+[](id self, SEL, id, id msg)
                              {
                                  if (auto p = getPimpl (self))
-                                     p->owner.invokeBinding (objc::getString (objc::call<id> (msg, "body")));
+                                 {
+                                     auto body = objc::getString (objc::call<id> (msg, "body"));
+
+                                     if (! p->handleInternalMessage (body))
+                                         p->owner.invokeBinding (body);
+                                 }
                              }),
                              "v@:@@");
 
@@ -1448,11 +1796,56 @@ struct WebView::Pimpl
         return true;
     }
 
+    // Intercepts internal bridge messages (drag arming) before the normal binding
+    // dispatcher. Returns true if the message was consumed here.
+    bool handleInternalMessage (const std::string& body)
+    {
+        if (body.rfind ("CHOC_DRAG:", 0) != 0)
+            return false;
+
+        pendingDragFilePaths.clear();
+
+        try
+        {
+            auto list = choc::json::parseValue (body.substr (10));
+
+            if (list.isArray())
+                for (uint32_t i = 0; i < list.size(); ++i)
+                    if (list[i].isString())
+                        pendingDragFilePaths.push_back (std::string (list[i].getString()));
+        }
+        catch (...) {}
+
+        // NB: starting the actual native drag-out from here is NOT possible with
+        // WINDOWED WebView2 hosting (used by choc): the render HWND consumes mouse
+        // input inside WebView2's own process, and there is no drag hook. Outbound
+        // drag requires VISUAL/COMPOSITION hosting (ICoreWebView2CompositionController4
+        // ::add_DragStarting + host-driven DoDragDrop). See the note in
+        // webviewControllerCreationComplete. The arm is kept for API parity.
+        return true;
+    }
+
+    // Forwards inbound dropped file paths to JS as a `chocfilesdropped` event.
+    void forwardDroppedFilesToJS (const std::vector<std::string>& paths)
+    {
+        if (paths.empty())
+            return;
+
+        auto arr = choc::value::createEmptyArray();
+
+        for (auto& p : paths)
+            arr.addArrayElement (p);
+
+        evaluateJavascript ("window.dispatchEvent (new CustomEvent ('chocfilesdropped', { detail: { paths: "
+                            + choc::json::toString (arr) + " } }));", {});
+    }
+
 private:
     WindowClass windowClass { L"CHOCWebView", (WNDPROC) wndProc };
     HWNDHolder hwnd;
     std::string defaultURI, setHTMLURI;
     WebView::Options::Resource pageHTML;
+    std::vector<std::string> pendingDragFilePaths;
 
     void webviewControllerCreationComplete (ICoreWebView2Controller* controller, ICoreWebView2* view)
     {
@@ -1461,6 +1854,24 @@ private:
 
         coreWebViewController = controller;
         coreWebView = view;
+
+        // Drag-and-drop status on Windows (windowed WebView2 hosting):
+        //   • Inbound  (OS → webview): tractable via an IDropTarget — register on
+        //     the host HWND after put_AllowExternalDrop(FALSE) (needs
+        //     ICoreWebView2Controller4), extract CF_HDROP paths, and forward via
+        //     forwardDroppedFilesToJS(). Outlined for a follow-up.
+        //   • Outbound (webview → OS): NOT achievable in windowed hosting — the
+        //     render HWND owns mouse input and there is no drag hook. It requires
+        //     switching to COMPOSITION hosting (CreateCoreWebView2CompositionController
+        //     + ICoreWebView2CompositionController4::add_DragStarting → host-driven
+        //     DoDragDrop). That is an architectural change to choc's Windows backend
+        //     and is deliberately deferred to a maintainer decision.
+        // The chocStartFileDrag JS helper is injected for cross-platform API parity;
+        // on Windows it arms paths but the native drag-out is a documented no-op
+        // pending the composition-hosting change above.
+        addInitScript ("window.chocStartFileDrag = function (paths) {"
+                       " try { window.chrome.webview.postMessage ('CHOC_DRAG:' + JSON.stringify (paths)); }"
+                       " catch (e) {} };");
 
         if (options.transparentBackground)
         {
@@ -1725,8 +2136,15 @@ private:
 
             LPWSTR message = {};
             args->TryGetWebMessageAsString (std::addressof (message));
-            ownerPimpl.owner.invokeBinding (createUTF8FromUTF16 (message));
-            sender->PostWebMessageAsString (message);
+
+            auto utf8 = createUTF8FromUTF16 (message);
+
+            if (! ownerPimpl.handleInternalMessage (utf8))
+            {
+                ownerPimpl.owner.invokeBinding (utf8);
+                sender->PostWebMessageAsString (message);
+            }
+
             CoTaskMemFree (message);
             return S_OK;
         }
