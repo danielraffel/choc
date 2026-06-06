@@ -35,6 +35,9 @@ if (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
     # WebView example requires WebKit on macOS
     add_executable(webview_desktop_app webview_desktop_app.cpp)
     target_link_libraries(webview_desktop_app PRIVATE "-framework WebKit" "-framework Cocoa")
+
+    add_executable(webview_drag_and_drop webview_drag_and_drop.cpp)
+    target_link_libraries(webview_drag_and_drop PRIVATE "-framework WebKit" "-framework Cocoa")
 elseif (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
     if (CHOC_BUILD_AUDIO_BEEP_PLAYER)
         # Audio beep player requires ALSA on Linux
@@ -51,6 +54,11 @@ elseif (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
         target_include_directories(webview_desktop_app PRIVATE ${GTK3_INCLUDE_DIRS} ${WEBKIT2_INCLUDE_DIRS})
         target_link_libraries(webview_desktop_app PRIVATE ${GTK3_LIBRARIES} ${WEBKIT2_LIBRARIES})
         target_compile_options(webview_desktop_app PRIVATE ${GTK3_CFLAGS_OTHER} ${WEBKIT2_CFLAGS_OTHER})
+
+        add_executable(webview_drag_and_drop webview_drag_and_drop.cpp)
+        target_include_directories(webview_drag_and_drop PRIVATE ${GTK3_INCLUDE_DIRS} ${WEBKIT2_INCLUDE_DIRS})
+        target_link_libraries(webview_drag_and_drop PRIVATE ${GTK3_LIBRARIES} ${WEBKIT2_LIBRARIES})
+        target_compile_options(webview_drag_and_drop PRIVATE ${GTK3_CFLAGS_OTHER} ${WEBKIT2_CFLAGS_OTHER})
     else()
         message(WARNING "WebView example disabled: GTK3 or WebKit2GTK not found")
     endif()
@@ -62,4 +70,8 @@ elseif (${CMAKE_SYSTEM_NAME} MATCHES "Windows")
 
     # WebView example should work on Windows without additional dependencies
     add_executable(webview_desktop_app webview_desktop_app.cpp)
+
+    # The drag-and-drop example also needs OLE / shell libs for inbound file drops
+    add_executable(webview_drag_and_drop webview_drag_and_drop.cpp)
+    target_link_libraries(webview_drag_and_drop PRIVATE ole32 oleaut32 shell32)
 endif()
