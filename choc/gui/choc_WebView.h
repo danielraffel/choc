@@ -1343,6 +1343,8 @@ private:
 #include <rpcndr.h>
 #include <objidl.h>
 #include <oaidl.h>
+#include <ole2.h>       // IDropTarget + OLE drag-and-drop (RegisterDragDrop, etc.)
+#include <shellapi.h>   // HDROP / DragQueryFileW (inbound CF_HDROP parsing)
 
 #ifndef __RPCNDR_H_VERSION__
 #error "This code requires an updated version of <rpcndr.h>"
@@ -1705,6 +1707,7 @@ struct WebView::Pimpl
     bool initialise()
     {
         CoInitialize (nullptr);
+        OleInitialize (nullptr); // required for RegisterDragDrop (inbound file drops)
 
         // You cam define this macro to provide a custom way of getting a
         // choc::file::DynamicLibrary that contains the redistributable
@@ -1742,11 +1745,25 @@ struct WebView::Pimpl
     {
         deletionChecker->deleted = true;
 
+        if (dropTarget != nullptr)
+        {
+            if (hwnd.hwnd != nullptr)
+            {
+                RevokeDragDrop (hwnd);
+                EnumChildWindows (hwnd, +[] (HWND child, LPARAM) -> BOOL { RevokeDragDrop (child); return TRUE; }, 0);
+            }
+
+            dropTarget->Release();
+            dropTarget = nullptr;
+        }
+
         eventHandler.reset();
         coreWebView.reset();
         coreWebViewController.reset();
         coreWebViewEnvironment.reset();
         hwnd.reset();
+
+        OleUninitialize();
     }
 
     static constexpr const char* postMessageFn = "window.chrome.webview.postMessage";
@@ -1840,12 +1857,126 @@ struct WebView::Pimpl
                             + choc::json::toString (arr) + " } }));", {});
     }
 
+    // OLE drop target for inbound OS file drops. Registered on the host HWND and
+    // the WebView2 render child HWNDs so a drop anywhere over the webview is
+    // caught and the file paths forwarded to JS as a `chocfilesdropped` event.
+    struct DnDTarget  : public IDropTarget
+    {
+        DnDTarget (Pimpl& p) : owner (p) {}
+
+        HRESULT STDMETHODCALLTYPE QueryInterface (REFIID iid, void** ppv) override
+        {
+            if (ppv == nullptr)
+                return E_POINTER;
+
+            if (iid == IID_IUnknown || iid == IID_IDropTarget)
+            {
+                *ppv = static_cast<IDropTarget*> (this);
+                AddRef();
+                return S_OK;
+            }
+
+            *ppv = nullptr;
+            return E_NOINTERFACE;
+        }
+
+        ULONG STDMETHODCALLTYPE AddRef() override   { return ++refCount; }
+        ULONG STDMETHODCALLTYPE Release() override  { auto c = --refCount; if (c == 0) delete this; return c; }
+
+        HRESULT STDMETHODCALLTYPE DragEnter (IDataObject* obj, DWORD, POINTL, DWORD* effect) override
+        {
+            hasFiles = hasFileData (obj);
+            if (effect) *effect = hasFiles ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE DragOver (DWORD, POINTL, DWORD* effect) override
+        {
+            if (effect) *effect = hasFiles ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE DragLeave() override { return S_OK; }
+
+        HRESULT STDMETHODCALLTYPE Drop (IDataObject* obj, DWORD, POINTL, DWORD* effect) override
+        {
+            if (effect) *effect = DROPEFFECT_COPY;
+            owner.forwardDroppedFilesToJS (extractFiles (obj));
+            return S_OK;
+        }
+
+        static bool hasFileData (IDataObject* obj)
+        {
+            FORMATETC fmt = { CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+            return obj != nullptr && obj->QueryGetData (std::addressof (fmt)) == S_OK;
+        }
+
+        static std::vector<std::string> extractFiles (IDataObject* obj)
+        {
+            std::vector<std::string> paths;
+            FORMATETC fmt = { CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+            STGMEDIUM medium = {};
+
+            if (obj != nullptr && obj->GetData (std::addressof (fmt), std::addressof (medium)) == S_OK)
+            {
+                if (auto hdrop = (HDROP) GlobalLock (medium.hGlobal))
+                {
+                    auto count = DragQueryFileW (hdrop, 0xFFFFFFFF, nullptr, 0);
+
+                    for (UINT i = 0; i < count; ++i)
+                    {
+                        auto len = DragQueryFileW (hdrop, i, nullptr, 0);
+                        std::wstring w (len, L'\0');
+                        DragQueryFileW (hdrop, i, w.data(), len + 1);
+                        paths.push_back (createUTF8FromUTF16 (w));
+                    }
+
+                    GlobalUnlock (medium.hGlobal);
+                }
+
+                ReleaseStgMedium (std::addressof (medium));
+            }
+
+            return paths;
+        }
+
+        Pimpl& owner;
+        std::atomic<ULONG> refCount { 0 };
+        bool hasFiles = false;
+    };
+
+    // Registers our drop target on the host HWND + every descendant (the WebView2
+    // render HWNDs), revoking any existing target first so ours receives the drop.
+    void registerDropTargets()
+    {
+        if (hwnd.hwnd == nullptr)
+            return;
+
+        if (dropTarget == nullptr)
+        {
+            dropTarget = new DnDTarget (*this);
+            dropTarget->AddRef();
+        }
+
+        RevokeDragDrop (hwnd);
+        RegisterDragDrop (hwnd, dropTarget);
+
+        EnumChildWindows (hwnd, +[] (HWND child, LPARAM lp) -> BOOL
+        {
+            auto* dt = (IDropTarget*) lp;
+            RevokeDragDrop (child);
+            RegisterDragDrop (child, dt);
+            return TRUE;
+        }, (LPARAM) dropTarget);
+    }
+
 private:
     WindowClass windowClass { L"CHOCWebView", (WNDPROC) wndProc };
     HWNDHolder hwnd;
     std::string defaultURI, setHTMLURI;
     WebView::Options::Resource pageHTML;
     std::vector<std::string> pendingDragFilePaths;
+    DnDTarget* dropTarget = nullptr;
 
     void webviewControllerCreationComplete (ICoreWebView2Controller* controller, ICoreWebView2* view)
     {
@@ -1856,10 +1987,9 @@ private:
         coreWebView = view;
 
         // Drag-and-drop status on Windows (windowed WebView2 hosting):
-        //   • Inbound  (OS → webview): tractable via an IDropTarget — register on
-        //     the host HWND after put_AllowExternalDrop(FALSE) (needs
-        //     ICoreWebView2Controller4), extract CF_HDROP paths, and forward via
-        //     forwardDroppedFilesToJS(). Outlined for a follow-up.
+        //   • Inbound  (OS → webview): IMPLEMENTED — an IDropTarget registered on the
+        //     host HWND + the WebView2 render child HWNDs (registerDropTargets()),
+        //     extracting CF_HDROP paths and forwarding via forwardDroppedFilesToJS().
         //   • Outbound (webview → OS): NOT achievable in windowed hosting — the
         //     render HWND owns mouse input and there is no drag hook. It requires
         //     switching to COMPOSITION hosting (CreateCoreWebView2CompositionController
@@ -1872,6 +2002,10 @@ private:
         addInitScript ("window.chocStartFileDrag = function (paths) {"
                        " try { window.chrome.webview.postMessage ('CHOC_DRAG:' + JSON.stringify (paths)); }"
                        " catch (e) {} };");
+
+        // Inbound: take over file-drop handling so we can forward native paths to JS.
+        registerDropTargets();
+        SetTimer (hwnd, 0xD0D, 1200, nullptr); // re-register once render child HWNDs exist
 
         if (options.transparentBackground)
         {
@@ -1978,6 +2112,15 @@ private:
         if (msg == WM_SHOWWINDOW)
             if (auto w = getPimpl (h))
                 w->setVisible (wp != 0);
+
+        // The WebView2 render child HWNDs are created shortly after the controller,
+        // so re-register the inbound drop target once they exist (one-shot).
+        if (msg == WM_TIMER && wp == 0xD0D)
+            if (auto w = getPimpl (h))
+            {
+                w->registerDropTargets();
+                KillTimer (h, 0xD0D);
+            }
 
         return DefWindowProcW (h, msg, wp, lp);
     }
