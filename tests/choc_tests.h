@@ -1123,6 +1123,18 @@ inline void testJSON (choc::test::TestProgress& progress)
     }
 
     {
+        CHOC_TEST (InvalidUnterminatedString)
+
+        // The string never closes, so the parser reaches the terminating null.
+        // It must stop there with an error rather than reading past the buffer.
+        auto json = R"(
+{ "field": "unterminated
+)";
+
+        checkError (json, "Unexpected EOF in string constant", 3, 1);
+    }
+
+    {
         CHOC_TEST (ValidLongNumber)
 
         auto json = R"(
